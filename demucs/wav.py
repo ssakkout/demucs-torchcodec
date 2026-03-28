@@ -10,6 +10,7 @@ import hashlib
 import math
 import json
 import os
+import warnings
 from pathlib import Path
 import tqdm
 
@@ -17,8 +18,9 @@ import musdb
 import julius
 import torch as th
 from torch import distributed
-import torchaudio as ta
 from torch.nn import functional as F
+
+from torchcodec import AudioDecoder, AudioEncoder
 
 from .audio import convert_audio_channels
 from . import distrib
@@ -35,44 +37,60 @@ def _track_metadata(track, sources, normalize=True, ext=EXT):
     for source in sources + [MIXTURE]:
         file = track / f"{source}{ext}"
         if source == MIXTURE and not file.exists():
-            audio = 0
+            wavs = []
+            sr = None
             for sub_source in sources:
                 sub_file = track / f"{sub_source}{ext}"
-                sub_audio, sr = ta.load(sub_file)
-                audio += sub_audio
+                decoder = AudioDecoder(str(sub_file))
+                samples = decoder.get_all_samples()
+                wavs.append(samples.data)
+                sr = samples.sample_rate
+                
+            audio = th.stack(wavs).sum(dim=0)
             would_clip = audio.abs().max() >= 1
             if would_clip:
-                assert ta.get_audio_backend() == 'soundfile', 'use dset.backend=soundfile'
-            ta.save(file, audio, sr, encoding='PCM_F')
+                warnings.warn(f"Mixture {file} will clip. torchcodec expects float values in [-1, 1].")
+            AudioEncoder(audio, sample_rate=sr).to_file(file)
 
         try:
-            info = ta.info(str(file))
+            decoder = AudioDecoder(str(file))
+            if source == MIXTURE and normalize:
+                samples = decoder.get_all_samples()
+                wav = samples.data
+                length = wav.shape[1]
+                info_sample_rate = samples.sample_rate
+            else:
+                # Use metadata properties to avoid fully decoding large tracks just for lengths
+                if hasattr(decoder.metadata, "duration_seconds") and decoder.metadata.duration_seconds is not None:
+                    info_sample_rate = decoder.metadata.sample_rate
+                    length = round(decoder.metadata.duration_seconds * info_sample_rate)
+                else:
+                    samples = decoder.get_all_samples()
+                    length = samples.data.shape[1]
+                    info_sample_rate = samples.sample_rate
+                    
         except RuntimeError:
             print(file)
             raise
-        length = info.num_frames
+            
         if track_length is None:
             track_length = length
-            track_samplerate = info.sample_rate
+            track_samplerate = info_sample_rate
         elif track_length != length:
             raise ValueError(
                 f"Invalid length for file {file}: "
                 f"expecting {track_length} but got {length}.")
-        elif info.sample_rate != track_samplerate:
+        elif info_sample_rate != track_samplerate:
             raise ValueError(
                 f"Invalid sample rate for file {file}: "
-                f"expecting {track_samplerate} but got {info.sample_rate}.")
+                f"expecting {track_samplerate} but got {info_sample_rate}.")
+                
         if source == MIXTURE and normalize:
-            try:
-                wav, _ = ta.load(str(file))
-            except RuntimeError:
-                print(file)
-                raise
             wav = wav.mean(0)
             mean = wav.mean().item()
             std = wav.std().item()
 
-    return {"length": length, "mean": mean, "std": std, "samplerate": track_samplerate}
+    return {"length": track_length, "mean": mean, "std": std, "samplerate": track_samplerate}
 
 
 def build_metadata(path, sources, normalize=True, ext=EXT):
@@ -167,9 +185,18 @@ class Wavset:
                 offset = int(meta['samplerate'] * self.shift * index)
                 num_frames = int(math.ceil(meta['samplerate'] * self.segment))
             wavs = []
+            
+            start_seconds = offset / meta['samplerate']
+            if num_frames == -1:
+                stop_seconds = None
+            else:
+                stop_seconds = start_seconds + (num_frames / meta['samplerate'])
+                
             for source in self.sources:
                 file = self.get_file(name, source)
-                wav, _ = ta.load(str(file), frame_offset=offset, num_frames=num_frames)
+                decoder = AudioDecoder(str(file))
+                samples = decoder.get_samples_played_in_range(start_seconds, stop_seconds)
+                wav = samples.data
                 wav = convert_audio_channels(wav, self.channels)
                 wavs.append(wav)
 

@@ -23,7 +23,7 @@ dset:
   metadata: ./metadata
   sources: ['drums', 'bass', 'other', 'vocals']
   valid_samples: # valid dataset size
-  backend: null   # if provided select torchaudio backend.
+  backend: null   
 
 test:
   save: False
@@ -164,7 +164,6 @@ hdemucs:  # see demucs/hdemucs.py for a detailed description
   # Weight init
   rescale: 0.1
 
-# Torchaudio implementation of HDemucs
 torch_hdemucs:
 # Channels
   channels: 48

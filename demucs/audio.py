@@ -7,14 +7,12 @@ import json
 import subprocess as sp
 from pathlib import Path
 
-import lameenc
 import julius
 import numpy as np
 import torch
-import torchaudio as ta
 import typing as tp
 
-from .utils import temp_filenames
+from torchcodec import AudioDecoder, AudioEncoder
 
 
 def _read_info(path):
@@ -95,45 +93,38 @@ class AudioFile:
                 Our definition of mono is simply the average of the two channels. Any other
                 value will be ignored.
         """
-        streams = np.array(range(len(self)))[streams]
-        single = not isinstance(streams, np.ndarray)
+        streams_idx = np.array(range(len(self)))[streams]
+        single = not isinstance(streams_idx, np.ndarray)
         if single:
-            streams = [streams]
+            streams_idx = [streams_idx]
 
-        if duration is None:
-            target_size = None
-            query_duration = None
-        else:
-            target_size = int((samplerate or self.samplerate()) * duration)
-            query_duration = float((target_size + 1) / (samplerate or self.samplerate()))
+        wavs = []
+        for stream in streams_idx:
+            abs_stream = self._audio_streams[stream]
+            decoder = AudioDecoder(
+                str(self.path),
+                stream_index=abs_stream,
+                sample_rate=samplerate,
+            )
+            
+            start_seconds = float(seek_time) if seek_time is not None else 0.0
+            stop_seconds = start_seconds + float(duration) if duration is not None else None
 
-        with temp_filenames(len(streams)) as filenames:
-            command = ['ffmpeg', '-y']
-            command += ['-loglevel', 'panic']
-            if seek_time:
-                command += ['-ss', str(seek_time)]
-            command += ['-i', str(self.path)]
-            for stream, filename in zip(streams, filenames):
-                command += ['-map', f'0:{self._audio_streams[stream]}']
-                if query_duration is not None:
-                    command += ['-t', str(query_duration)]
-                command += ['-threads', '1']
-                command += ['-f', 'f32le']
-                if samplerate is not None:
-                    command += ['-ar', str(samplerate)]
-                command += [filename]
+            samples = decoder.get_samples_played_in_range(start_seconds, stop_seconds)
+            wav = samples.data
 
-            sp.run(command, check=True)
-            wavs = []
-            for filename in filenames:
-                wav = np.fromfile(filename, dtype=np.float32)
-                wav = torch.from_numpy(wav)
-                wav = wav.view(-1, self.channels()).t()
-                if channels is not None:
-                    wav = convert_audio_channels(wav, channels)
-                if target_size is not None:
-                    wav = wav[..., :target_size]
-                wavs.append(wav)
+            # Apply demucs' custom channel mixing strategy if requested
+            if channels is not None:
+                wav = convert_audio_channels(wav, channels)
+
+            # Ensure we clip to the exact target sample size natively requested
+            if duration is not None:
+                sr = samplerate or self.samplerate(stream)
+                target_size = int(sr * duration)
+                wav = wav[..., :target_size]
+                
+            wavs.append(wav)
+
         wav = torch.stack(wavs, dim=0)
         if single:
             wav = wav[0]
@@ -146,17 +137,14 @@ def convert_audio_channels(wav, channels=2):
     if src_channels == channels:
         pass
     elif channels == 1:
-        # Case 1:
         # The caller asked 1-channel audio, but the stream have multiple
         # channels, downmix all channels.
         wav = wav.mean(dim=-2, keepdim=True)
     elif src_channels == 1:
-        # Case 2:
         # The caller asked for multiple channels, but the input file have
         # one single channel, replicate the audio over all channels.
         wav = wav.expand(*shape, channels, length)
     elif src_channels >= channels:
-        # Case 3:
         # The caller asked for multiple channels, and the input file have
         # more channels than requested. In that case return the first channels.
         wav = wav[..., :channels, :]
@@ -198,21 +186,11 @@ def as_dtype_pcm(wav, dtype):
 
 def encode_mp3(wav, path, samplerate=44100, bitrate=320, quality=2, verbose=False):
     """Save given audio as mp3. This should work on all OSes."""
-    C, T = wav.shape
-    wav = i16_pcm(wav)
-    encoder = lameenc.Encoder()
-    encoder.set_bit_rate(bitrate)
-    encoder.set_in_sample_rate(samplerate)
-    encoder.set_channels(C)
-    encoder.set_quality(quality)  # 2-highest, 7-fastest
-    if not verbose:
-        encoder.silence()
-    wav = wav.data.cpu()
-    wav = wav.transpose(0, 1).numpy()
-    mp3_data = encoder.encode(wav.tobytes())
-    mp3_data += encoder.flush()
-    with open(path, "wb") as f:
-        f.write(mp3_data)
+    # Ensure float32 bounds in [-1, 1] for torchcodec.AudioEncoder
+    wav = f32_pcm(wav)
+    encoder = AudioEncoder(wav, sample_rate=samplerate)
+    # bitrate is in kbps from legacy lameenc, convert to bps for torchcodec
+    encoder.to_file(path, bit_rate=bitrate * 1000)
 
 
 def prevent_clip(wav, mode='rescale'):
@@ -249,17 +227,15 @@ def save_audio(wav: torch.Tensor,
     wav = prevent_clip(wav, mode=clip)
     path = Path(path)
     suffix = path.suffix.lower()
+
+    # torchcodec.AudioEncoder only accepts float32 bounding in [-1, 1]
+    wav = f32_pcm(wav)
+    encoder = AudioEncoder(wav, sample_rate=samplerate)
+
     if suffix == ".mp3":
-        encode_mp3(wav, path, samplerate, bitrate, preset, verbose=True)
-    elif suffix == ".wav":
-        if as_float:
-            bits_per_sample = 32
-            encoding = 'PCM_F'
-        else:
-            encoding = 'PCM_S'
-        ta.save(str(path), wav, sample_rate=samplerate,
-                encoding=encoding, bits_per_sample=bits_per_sample)
-    elif suffix == ".flac":
-        ta.save(str(path), wav, sample_rate=samplerate, bits_per_sample=bits_per_sample)
+        encoder.to_file(path, bit_rate=bitrate * 1000)
+    elif suffix in [".wav", ".flac"]:
+        # torchcodec auto-detects standard formats using the FFmpeg defaults
+        encoder.to_file(path)
     else:
         raise ValueError(f"Invalid suffix for path: {suffix}")

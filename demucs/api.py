@@ -23,8 +23,7 @@ See the end of this module (if __name__ == "__main__")
 import subprocess
 
 import torch as th
-import torchaudio as ta
-
+from torchcodec.decoders import AudioDecoder
 from dora.log import fatal
 from pathlib import Path
 from typing import Optional, Callable, Dict, Tuple, Union
@@ -221,9 +220,18 @@ class Separator:
 
         if wav is None:
             try:
-                wav, sr = ta.load(str(track))
-            except RuntimeError as err:
-                errors["torchaudio"] = err.args[0]
+                # Initialize the decoder with the audio file
+                decoder = AudioDecoder(str(track))
+                
+                # Extract all samples
+                audio_samples = decoder.get_all_samples()
+                
+                # Get the tensor and the original sample rate
+                wav = audio_samples.data
+                sr = audio_samples.sample_rate
+
+            except Exception as err:
+                errors["torchcodec"] = err.args[0] if err.args else str(err)
             else:
                 wav = convert_audio(wav, sr, self._samplerate, self._audio_channels)
 

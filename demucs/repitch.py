@@ -10,7 +10,7 @@ import subprocess as sp
 import tempfile
 
 import torch
-import torchaudio as ta
+from torchcodec import AudioDecoder
 
 from .audio import save_audio
 
@@ -81,6 +81,12 @@ def repitch(wav, pitch, tempo, voice=False, quick=False, samplerate=44100):
         sp.run(command, capture_output=True, check=True)
     except sp.CalledProcessError as error:
         raise RuntimeError(f"Could not change bpm because {error.stderr.decode('utf-8')}")
-    wav, sr = ta.load(outfile.name)
+    
+    # Use torchcodec for decoding
+    decoder = AudioDecoder(outfile.name)
+    samples = decoder.get_all_samples()
+    wav = samples.data
+    sr = samples.sample_rate
+    
     assert sr == samplerate
     return wav

@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 dependencies = ['dora-search', 'julius', 'lameenc', 'openunmix', 'pyyaml',
-                'torch', 'torchaudio', 'tqdm']
+                'torch', 'torchcodec', 'tqdm']
 
 from demucs.pretrained import get_model
 
