@@ -5,7 +5,7 @@ This version replaces torchaudio with torchcodec.
 **Usage:**
 
 ```
-pip install -U git+https://github.com/ssakkout/demucs.git
+pip install -U git+https://github.com/ssakkout/demucs-torchcodec.git
 ```
 
 **Credit: Alexandre Défossez**
